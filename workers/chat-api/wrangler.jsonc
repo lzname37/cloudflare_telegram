@@ -1,0 +1,35 @@
+{
+  "name": "chat-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-05-02",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CHAT_ROOM",
+        "class_name": "ChatRoom"
+      }
+    ]
+  },
+  "d1_databases": [
+    {
+      "binding": "CHAT_DB",
+      "database_name": "chat-db",
+      "database_id": "replace-with-your-d1-database-id"
+    }
+  ],
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "ChatRoom"
+      ]
+    }
+  ],
+  "vars": {
+    "ALLOWED_ORIGINS": "http://localhost:5173",
+    "SESSION_TTL_SECONDS": "604800"
+  }
+}
