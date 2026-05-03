@@ -16,15 +16,15 @@
   "d1_databases": [
     {
       "binding": "CHAT_DB",
-      "database_name": "cftg",
+      "database_name": "chat-db",
       "database_id": "79789a2b-6990-463f-ab64-bbc7469362fc"
     }
   ],
   "r2_buckets": [
     {
       "binding": "CHAT_MEDIA",
-      "bucket_name": "cftg",
-      "preview_bucket_name": "cftg"
+      "bucket_name": "chat-media",
+      "preview_bucket_name": "chat-media-preview"
     }
   ],
   "migrations": [
