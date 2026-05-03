@@ -1,42 +1,52 @@
 {
-  "name": "chat-api",
-  "main": "src/index.ts",
-  "compatibility_date": "2026-05-02",
-  "compatibility_flags": [
-    "nodejs_compat"
-  ],
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "CHAT_ROOM",
-        "class_name": "ChatRoom"
-      }
-    ]
-  },
-  "d1_databases": [
-    {
-      "binding": "CHAT_DB",
-      "database_name": "chat-db",
-      "database_id": "79789a2b-6990-463f-ab64-bbc7469362fc"
-    }
-  ],
-  "r2_buckets": [
-    {
-      "binding": "CHAT_MEDIA",
-      "bucket_name": "chat-media",
-      "preview_bucket_name": "chat-media-preview"
-    }
-  ],
-  "migrations": [
-    {
-      "tag": "v1",
-      "new_sqlite_classes": [
-        "ChatRoom"
-      ]
-    }
-  ],
-  "vars": {
-    "ALLOWED_ORIGINS": "https://chat-api.2775420494.workers.dev",
-    "SESSION_TTL_SECONDS": "604800"
-  }
+	"name": "chat-api",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-05-02",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "CHAT_ROOM",
+				"class_name": "ChatRoom"
+			}
+		]
+	},
+	"d1_databases": [
+		{
+			"binding": "CHAT_DB",
+			"database_name": "chat-db",
+			"database_id": "79789a2b-6990-463f-ab64-bbc7469362fc"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "CHAT_MEDIA",
+			"bucket_name": "chat-media",
+			"preview_bucket_name": "chat-media-preview"
+		},
+		{
+			"bucket_name": "chat-media",
+			"binding": "chat_media",
+			"remote": true
+		},
+		{
+			"bucket_name": "chat-media-preview",
+			"binding": "chat_media_preview",
+			"remote": true
+		}
+	],
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": [
+				"ChatRoom"
+			]
+		}
+	],
+	"vars": {
+		"ALLOWED_ORIGINS": ["https://chat-api.2775420494.workers.dev", "https://cftg.ifantic.de"],
+		"SESSION_TTL_SECONDS": "604800"
+	}
 }
