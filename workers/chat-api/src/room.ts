@@ -1,12 +1,17 @@
 import { DurableObject } from "cloudflare:workers";
 import {
+  MAX_IMAGE_SIZE_BYTES,
   MAX_MESSAGE_LENGTH,
+  isImageMimeType,
+  isRoomScopedImageKey,
+  type AnyChatMessage,
   type ApiErrorCode,
-  type ChatMessage,
   type ClientSocketEvent,
+  type ImageMimeType,
   type ServerSocketEvent
 } from "../../../packages/shared/protocol";
 import { SlidingWindowRateLimiter } from "./rate-limit";
+import { resolveRoomId } from "./utils";
 
 type RoomEnv = {
   CHAT_DB: D1Database;
@@ -16,10 +21,15 @@ type SocketAttachment = {
   roomId: string;
   userId: string;
   nickname: string;
+  mediaBaseUrl: string;
 };
 
 const MESSAGE_RATE_LIMIT = 12;
 const MESSAGE_RATE_WINDOW_MS = 10_000;
+
+function buildImageUrl(mediaBaseUrl: string, imageKey: string): string {
+  return `${mediaBaseUrl}/${encodeURIComponent(imageKey)}`;
+}
 
 export class ChatRoom extends DurableObject<RoomEnv> {
   private readonly rateLimiter = new SlidingWindowRateLimiter();
@@ -34,11 +44,14 @@ export class ChatRoom extends DurableObject<RoomEnv> {
       return new Response("Expected WebSocket upgrade", { status: 426 });
     }
 
-    const roomId = url.searchParams.get("room") ?? "global";
+    const roomFromHeader = request.headers.get("x-room-id");
+    const roomFromQuery = url.searchParams.get("room");
+    const roomId = resolveRoomId(roomFromHeader ?? roomFromQuery);
     const userId = request.headers.get("x-user-id");
     const nickname = request.headers.get("x-nickname");
+    const mediaBaseUrl = request.headers.get("x-media-base-url");
 
-    if (!userId || !nickname) {
+    if (!roomId || !userId || !nickname || !mediaBaseUrl) {
       return new Response("Unauthorized", { status: 401 });
     }
 
@@ -50,7 +63,8 @@ export class ChatRoom extends DurableObject<RoomEnv> {
     server.serializeAttachment({
       roomId,
       userId,
-      nickname
+      nickname,
+      mediaBaseUrl
     } satisfies SocketAttachment);
     this.broadcastPresence();
 
@@ -63,18 +77,17 @@ export class ChatRoom extends DurableObject<RoomEnv> {
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const attachment = ws.deserializeAttachment() as SocketAttachment | null;
     if (!attachment) {
-      this.sendSocketError(ws, "unauthorized", "会话已失效");
+      this.sendSocketError(ws, "unauthorized", "Missing socket session");
       ws.close(1008, "Missing session");
       return;
     }
 
-    const payloadText =
-      typeof message === "string" ? message : new TextDecoder().decode(message);
+    const payloadText = typeof message === "string" ? message : new TextDecoder().decode(message);
     let event: ClientSocketEvent;
     try {
       event = JSON.parse(payloadText) as ClientSocketEvent;
     } catch {
-      this.sendSocketError(ws, "bad_request", "消息格式错误");
+      this.sendSocketError(ws, "bad_request", "Invalid message payload");
       return;
     }
 
@@ -87,48 +100,23 @@ export class ChatRoom extends DurableObject<RoomEnv> {
       return;
     }
 
-    if (event.type !== "send_message") {
-      this.sendSocketError(ws, "bad_request", "不支持的事件类型");
-      return;
-    }
-
-    const content = event.content.trim();
-    if (!content) {
-      this.sendSocketError(ws, "message_empty", "消息内容不能为空");
-      return;
-    }
-
-    if (content.length > MAX_MESSAGE_LENGTH) {
-      this.sendSocketError(ws, "message_too_long", `消息长度不能超过 ${MAX_MESSAGE_LENGTH} 字符`);
-      return;
-    }
-
     const rateLimitKey = `${attachment.roomId}:${attachment.userId}`;
     if (!this.rateLimiter.consume(rateLimitKey, MESSAGE_RATE_LIMIT, MESSAGE_RATE_WINDOW_MS)) {
-      this.sendSocketError(ws, "rate_limited", "消息发送过于频繁，请稍后重试");
+      this.sendSocketError(ws, "rate_limited", "Sending messages too fast");
       return;
     }
 
-    const chatMessage: ChatMessage = {
-      id: crypto.randomUUID(),
-      roomId: attachment.roomId,
-      userId: attachment.userId,
-      nickname: attachment.nickname,
-      content,
-      createdAt: Date.now()
-    };
-
-    this.broadcast({
-      type: "message",
-      message: chatMessage
-    });
-
-    try {
-      await this.persistMessage(chatMessage);
-    } catch (error) {
-      console.error("Failed to persist chat message", error);
-      this.sendSocketError(ws, "internal_error", "消息已发送，但持久化失败");
+    if (event.type === "send_message" || event.type === "send_text") {
+      await this.handleSendText(ws, attachment, event.content);
+      return;
     }
+
+    if (event.type === "send_image") {
+      await this.handleSendImage(ws, attachment, event.imageKey, event.mimeType, event.sizeBytes);
+      return;
+    }
+
+    this.sendSocketError(ws, "bad_request", "Unsupported event type");
   }
 
   async webSocketClose(_ws: WebSocket, _code: number, _reason: string): Promise<void> {
@@ -139,19 +127,113 @@ export class ChatRoom extends DurableObject<RoomEnv> {
     this.broadcastPresence();
   }
 
-  private async persistMessage(message: ChatMessage): Promise<void> {
+  private async handleSendText(ws: WebSocket, attachment: SocketAttachment, rawContent: string): Promise<void> {
+    const content = rawContent.trim();
+    if (!content) {
+      this.sendSocketError(ws, "message_empty", "Message cannot be empty");
+      return;
+    }
+
+    if (content.length > MAX_MESSAGE_LENGTH) {
+      this.sendSocketError(ws, "message_too_long", `Message is too long (max ${MAX_MESSAGE_LENGTH})`);
+      return;
+    }
+
+    const chatMessage: AnyChatMessage = {
+      id: crypto.randomUUID(),
+      roomId: attachment.roomId,
+      userId: attachment.userId,
+      nickname: attachment.nickname,
+      createdAt: Date.now(),
+      kind: "text",
+      content
+    };
+
+    await this.broadcastAndPersist(chatMessage, ws);
+  }
+
+  private async handleSendImage(
+    ws: WebSocket,
+    attachment: SocketAttachment,
+    imageKey: string,
+    mimeType: ImageMimeType,
+    sizeBytes: number
+  ): Promise<void> {
+    if (typeof imageKey !== "string" || !isRoomScopedImageKey(imageKey, attachment.roomId, attachment.userId)) {
+      this.sendSocketError(ws, "invalid_image_key", "Image key is not valid for this room");
+      return;
+    }
+
+    if (!isImageMimeType(mimeType)) {
+      this.sendSocketError(ws, "invalid_image", "Unsupported image MIME type");
+      return;
+    }
+
+    if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) {
+      this.sendSocketError(ws, "invalid_image", "Invalid image size");
+      return;
+    }
+
+    if (sizeBytes > MAX_IMAGE_SIZE_BYTES) {
+      this.sendSocketError(ws, "image_too_large", "Image exceeds size limit");
+      return;
+    }
+
+    const chatMessage: AnyChatMessage = {
+      id: crypto.randomUUID(),
+      roomId: attachment.roomId,
+      userId: attachment.userId,
+      nickname: attachment.nickname,
+      createdAt: Date.now(),
+      kind: "image",
+      imageKey,
+      imageMimeType: mimeType,
+      imageSizeBytes: sizeBytes,
+      imageUrl: buildImageUrl(attachment.mediaBaseUrl, imageKey)
+    };
+
+    await this.broadcastAndPersist(chatMessage, ws);
+  }
+
+  private async broadcastAndPersist(message: AnyChatMessage, ws: WebSocket): Promise<void> {
+    this.broadcast({
+      type: "message",
+      message
+    });
+
+    try {
+      await this.persistMessage(message);
+    } catch (error) {
+      console.error("Failed to persist chat message", error);
+      this.sendSocketError(ws, "internal_error", "Message broadcasted but persistence failed");
+    }
+  }
+
+  private async persistMessage(message: AnyChatMessage): Promise<void> {
+    const messageType = message.kind;
+    const content = message.kind === "text" ? message.content : "";
+    const imageKey = message.kind === "image" ? message.imageKey : null;
+    const imageMimeType = message.kind === "image" ? message.imageMimeType : null;
+    const imageSizeBytes = message.kind === "image" ? message.imageSizeBytes : null;
+
     await this.env.CHAT_DB.batch([
       this.env.CHAT_DB.prepare(
         `
-          INSERT INTO messages (id, room_id, user_id, nickname, content, created_at)
-          VALUES (?, ?, ?, ?, ?, ?)
+          INSERT INTO messages (
+            id, room_id, user_id, nickname, message_type, content, image_key, image_mime_type, image_size_bytes, created_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `
       ).bind(
         message.id,
         message.roomId,
         message.userId,
         message.nickname,
-        message.content,
+        messageType,
+        content,
+        imageKey,
+        imageMimeType,
+        imageSizeBytes,
         message.createdAt
       ),
       this.env.CHAT_DB.prepare(

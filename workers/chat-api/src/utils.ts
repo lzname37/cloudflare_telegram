@@ -1,4 +1,11 @@
-import type { ApiErrorCode, ApiErrorResponse } from "../../../packages/shared/protocol";
+import {
+  API_PATHS,
+  GLOBAL_ROOM_ID,
+  isValidRoomId,
+  normalizeRoomId,
+  type ApiErrorCode,
+  type ApiErrorResponse
+} from "../../../packages/shared/protocol";
 
 type OriginEnv = {
   ALLOWED_ORIGINS?: string;
@@ -9,12 +16,25 @@ export type ErrorResponseInput = {
   message: string;
 };
 
+function normalizeOriginValue(raw: string): string | null {
+  const value = raw.trim();
+  if (!value) {
+    return null;
+  }
+
+  try {
+    return new URL(value).origin;
+  } catch {
+    return value.replace(/\/+$/g, "");
+  }
+}
+
 function parseAllowedOrigins(raw?: string): Set<string> {
   return new Set(
     (raw ?? "")
       .split(",")
-      .map((item) => item.trim())
-      .filter(Boolean)
+      .map((item) => normalizeOriginValue(item))
+      .filter((item): item is string => Boolean(item))
   );
 }
 
@@ -29,7 +49,12 @@ export function resolveAllowedOrigin(request: Request, env: OriginEnv): string |
     return null;
   }
 
-  return allowedOrigins.has(originHeader) ? originHeader : null;
+  const normalizedOrigin = normalizeOriginValue(originHeader);
+  if (!normalizedOrigin) {
+    return null;
+  }
+
+  return allowedOrigins.has(normalizedOrigin) ? normalizedOrigin : null;
 }
 
 export function buildCorsHeaders(request: Request, env: OriginEnv): Headers {
@@ -105,4 +130,17 @@ export function decodeCursor(cursor: string): { createdAt: number; id: string } 
   }
 
   return { createdAt, id };
+}
+
+export function resolveRoomId(raw: string | null | undefined): string | null {
+  const normalized = normalizeRoomId(raw ?? GLOBAL_ROOM_ID);
+  return isValidRoomId(normalized) ? normalized : null;
+}
+
+export function buildMediaUrl(request: Request, imageKey: string): string {
+  const url = new URL(request.url);
+  url.pathname = `${API_PATHS.media}/${encodeURIComponent(imageKey)}`;
+  url.search = "";
+  url.hash = "";
+  return url.toString();
 }

@@ -3,18 +3,25 @@ import {
   DEFAULT_HISTORY_LIMIT,
   GLOBAL_ROOM_ID,
   MAX_HISTORY_LIMIT,
+  MAX_IMAGE_SIZE_BYTES,
   MAX_NICKNAME_LENGTH,
-  type ChatMessage,
+  createImageObjectKey,
+  isImageMimeType,
+  isSafeImageKey,
+  type AnyChatMessage,
   type CreateSessionRequest,
   type CreateSessionResponse,
+  type ImageMimeType,
   type MessageHistoryResponse,
   type ReconnectSyncResponse,
-  type SessionPayload
+  type SessionPayload,
+  type UploadImageResponse
 } from "../../../packages/shared/protocol";
 import { createSessionToken, verifySessionToken } from "./crypto";
 import { SlidingWindowRateLimiter } from "./rate-limit";
 import { ChatRoom } from "./room";
 import {
+  buildMediaUrl,
   buildCorsHeaders,
   decodeCursor,
   encodeCursor,
@@ -23,7 +30,8 @@ import {
   getClientIp,
   jsonResponse,
   normalizeNickname,
-  resolveAllowedOrigin
+  resolveAllowedOrigin,
+  resolveRoomId
 } from "./utils";
 
 export { ChatRoom } from "./room";
@@ -33,13 +41,18 @@ type MessageRecord = {
   room_id: string;
   user_id: string;
   nickname: string;
-  content: string;
+  message_type: string | null;
+  content: string | null;
+  image_key: string | null;
+  image_mime_type: string | null;
+  image_size_bytes: number | null;
   created_at: number;
 };
 
 export interface Env {
   CHAT_ROOM: DurableObjectNamespace<ChatRoom>;
   CHAT_DB: D1Database;
+  CHAT_MEDIA: R2Bucket;
   SESSION_SECRET: string;
   ALLOWED_ORIGINS?: string;
   SESSION_TTL_SECONDS?: string;
@@ -69,15 +82,72 @@ function assertAllowedOrigin(request: Request, env: Env): Response | null {
   return null;
 }
 
-function mapMessageRecord(record: MessageRecord): ChatMessage {
-  return {
+function toMessage(record: MessageRecord, request: Request): AnyChatMessage {
+  const base = {
     id: record.id,
     roomId: record.room_id,
     userId: record.user_id,
     nickname: record.nickname,
-    content: record.content,
     createdAt: record.created_at
   };
+
+  if (
+    record.message_type === "image" &&
+    record.image_key &&
+    record.image_mime_type &&
+    isImageMimeType(record.image_mime_type) &&
+    Number.isFinite(record.image_size_bytes)
+  ) {
+    return {
+      ...base,
+      kind: "image",
+      imageKey: record.image_key,
+      imageMimeType: record.image_mime_type as ImageMimeType,
+      imageSizeBytes: Number(record.image_size_bytes),
+      imageUrl: buildMediaUrl(request, record.image_key)
+    };
+  }
+
+  return {
+    ...base,
+    kind: "text",
+    content: record.content ?? ""
+  };
+}
+
+function parseRoomOrError(request: Request, env: Env, raw: string | null): { roomId: string } | { error: Response } {
+  const roomId = resolveRoomId(raw ?? GLOBAL_ROOM_ID);
+  if (!roomId) {
+    return {
+      error: errorResponse(request, env, 400, {
+        code: "invalid_room",
+        message: "Invalid room id"
+      })
+    };
+  }
+
+  return { roomId };
+}
+
+function mediaBaseUrl(request: Request): string {
+  const url = new URL(request.url);
+  url.pathname = API_PATHS.media;
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
+function extractMediaKey(pathname: string): string | null {
+  const prefix = `${API_PATHS.media}/`;
+  if (!pathname.startsWith(prefix)) {
+    return null;
+  }
+
+  try {
+    return decodeURIComponent(pathname.slice(prefix.length));
+  } catch {
+    return null;
+  }
 }
 
 async function handleCreateSession(request: Request, env: Env): Promise<Response> {
@@ -99,7 +169,7 @@ async function handleCreateSession(request: Request, env: Env): Promise<Response
   if (!payload || typeof payload.nickname !== "string") {
     return errorResponse(request, env, 400, {
       code: "invalid_nickname",
-      message: "昵称格式不正确"
+      message: "Invalid nickname"
     });
   }
 
@@ -107,7 +177,7 @@ async function handleCreateSession(request: Request, env: Env): Promise<Response
   if (!nickname || nickname.length > MAX_NICKNAME_LENGTH) {
     return errorResponse(request, env, 400, {
       code: "invalid_nickname",
-      message: `昵称不能为空且长度不能超过 ${MAX_NICKNAME_LENGTH} 字符`
+      message: `Nickname must be 1-${MAX_NICKNAME_LENGTH} chars`
     });
   }
 
@@ -115,7 +185,7 @@ async function handleCreateSession(request: Request, env: Env): Promise<Response
   if (!sessionRateLimiter.consume(`session:${ip}`, SESSION_RATE_LIMIT_PER_MINUTE, 60_000)) {
     return errorResponse(request, env, 429, {
       code: "rate_limited",
-      message: "请求过于频繁，请稍后再试"
+      message: "Too many session requests"
     });
   }
 
@@ -168,18 +238,16 @@ async function fetchHistory(request: Request, env: Env): Promise<Response> {
   if (!session) {
     return errorResponse(request, env, 401, {
       code: "invalid_token",
-      message: "无效或过期的 token"
+      message: "Invalid or expired token"
     });
   }
 
   const url = new URL(request.url);
-  const roomId = url.searchParams.get("room") ?? GLOBAL_ROOM_ID;
-  if (roomId !== GLOBAL_ROOM_ID) {
-    return errorResponse(request, env, 400, {
-      code: "invalid_room",
-      message: "首版仅支持 global 房间"
-    });
+  const parsedRoom = parseRoomOrError(request, env, url.searchParams.get("room"));
+  if ("error" in parsedRoom) {
+    return parsedRoom.error;
   }
+  const roomId = parsedRoom.roomId;
 
   const after = url.searchParams.get("after");
   if (after) {
@@ -187,13 +255,13 @@ async function fetchHistory(request: Request, env: Env): Promise<Response> {
     if (!Number.isFinite(afterTimestamp)) {
       return errorResponse(request, env, 400, {
         code: "bad_request",
-        message: "after 参数必须为时间戳"
+        message: "after must be a timestamp"
       });
     }
 
     const query = await env.CHAT_DB.prepare(
       `
-        SELECT id, room_id, user_id, nickname, content, created_at
+        SELECT id, room_id, user_id, nickname, message_type, content, image_key, image_mime_type, image_size_bytes, created_at
         FROM messages
         WHERE room_id = ? AND created_at > ?
         ORDER BY created_at ASC, id ASC
@@ -207,7 +275,7 @@ async function fetchHistory(request: Request, env: Env): Promise<Response> {
       ok: true,
       data: {
         roomId,
-        items: (query.results ?? []).map(mapMessageRecord)
+        items: (query.results ?? []).map((record) => toMessage(record, request))
       }
     };
 
@@ -219,7 +287,7 @@ async function fetchHistory(request: Request, env: Env): Promise<Response> {
   const cursorRaw = url.searchParams.get("cursor");
 
   let queryText = `
-    SELECT id, room_id, user_id, nickname, content, created_at
+    SELECT id, room_id, user_id, nickname, message_type, content, image_key, image_mime_type, image_size_bytes, created_at
     FROM messages
     WHERE room_id = ?
   `;
@@ -230,7 +298,7 @@ async function fetchHistory(request: Request, env: Env): Promise<Response> {
     if (!cursor) {
       return errorResponse(request, env, 400, {
         code: "bad_request",
-        message: "cursor 参数格式不正确"
+        message: "Invalid cursor format"
       });
     }
 
@@ -243,7 +311,7 @@ async function fetchHistory(request: Request, env: Env): Promise<Response> {
 
   const rows = await env.CHAT_DB.prepare(queryText).bind(...bindValues).all<MessageRecord>();
   const records = rows.results ?? [];
-  const items = records.map(mapMessageRecord).reverse();
+  const items = records.map((record) => toMessage(record, request)).reverse();
   const tail = records.at(records.length - 1);
 
   const responseBody: MessageHistoryResponse = {
@@ -258,6 +326,125 @@ async function fetchHistory(request: Request, env: Env): Promise<Response> {
   return jsonResponse(request, env, responseBody);
 }
 
+async function handleUploadImage(request: Request, env: Env): Promise<Response> {
+  const originError = assertAllowedOrigin(request, env);
+  if (originError) {
+    return originError;
+  }
+
+  const session = await authenticate(request, env);
+  if (!session) {
+    return errorResponse(request, env, 401, {
+      code: "invalid_token",
+      message: "Invalid or expired token"
+    });
+  }
+
+  const url = new URL(request.url);
+  const parsedRoom = parseRoomOrError(request, env, url.searchParams.get("room"));
+  if ("error" in parsedRoom) {
+    return parsedRoom.error;
+  }
+  const roomId = parsedRoom.roomId;
+
+  let formData: FormData;
+  try {
+    formData = await request.formData();
+  } catch {
+    return errorResponse(request, env, 400, {
+      code: "bad_request",
+      message: "Expected multipart/form-data payload"
+    });
+  }
+
+  const file = formData.get("file");
+  if (!(file instanceof File)) {
+    return errorResponse(request, env, 400, {
+      code: "invalid_image",
+      message: "Missing image file"
+    });
+  }
+
+  const mimeType = file.type.toLowerCase();
+  if (!isImageMimeType(mimeType)) {
+    return errorResponse(request, env, 400, {
+      code: "invalid_image",
+      message: "Unsupported image MIME type"
+    });
+  }
+
+  if (file.size <= 0) {
+    return errorResponse(request, env, 400, {
+      code: "invalid_image",
+      message: "Image file is empty"
+    });
+  }
+
+  if (file.size > MAX_IMAGE_SIZE_BYTES) {
+    return errorResponse(request, env, 400, {
+      code: "image_too_large",
+      message: `Image size must be <= ${Math.floor(MAX_IMAGE_SIZE_BYTES / (1024 * 1024))}MB`
+    });
+  }
+
+  const imageKey = createImageObjectKey(roomId, session.userId, mimeType);
+  await env.CHAT_MEDIA.put(imageKey, file.stream(), {
+    httpMetadata: {
+      contentType: mimeType
+    },
+    customMetadata: {
+      roomId,
+      userId: session.userId,
+      sizeBytes: String(file.size)
+    }
+  });
+
+  const responseBody: UploadImageResponse = {
+    ok: true,
+    data: {
+      roomId,
+      imageKey,
+      mimeType,
+      sizeBytes: file.size
+    }
+  };
+
+  return jsonResponse(request, env, responseBody, 201);
+}
+
+async function handleMediaRequest(request: Request, env: Env): Promise<Response> {
+  const originError = assertAllowedOrigin(request, env);
+  if (originError) {
+    return originError;
+  }
+
+  const imageKey = extractMediaKey(new URL(request.url).pathname);
+  if (!imageKey || !isSafeImageKey(imageKey)) {
+    return errorResponse(request, env, 400, {
+      code: "invalid_image_key",
+      message: "Invalid image key"
+    });
+  }
+
+  const object = await env.CHAT_MEDIA.get(imageKey);
+  if (!object || !object.body) {
+    return errorResponse(request, env, 404, {
+      code: "not_found",
+      message: "Image not found"
+    });
+  }
+
+  const headers = buildCorsHeaders(request, env);
+  headers.set("Cache-Control", "public, max-age=31536000, immutable");
+  headers.set("ETag", object.httpEtag);
+  object.writeHttpMetadata(headers);
+  if (!headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/octet-stream");
+  }
+
+  return new Response(object.body, { status: 200, headers });
+}
+
 async function handleWebSocket(request: Request, env: Env): Promise<Response> {
   const originError = assertAllowedOrigin(request, env);
   if (originError) {
@@ -265,19 +452,17 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
   }
 
   const url = new URL(request.url);
-  const roomId = url.searchParams.get("room") ?? GLOBAL_ROOM_ID;
-  if (roomId !== GLOBAL_ROOM_ID) {
-    return errorResponse(request, env, 400, {
-      code: "invalid_room",
-      message: "首版仅支持 global 房间"
-    });
+  const parsedRoom = parseRoomOrError(request, env, url.searchParams.get("room"));
+  if ("error" in parsedRoom) {
+    return parsedRoom.error;
   }
+  const roomId = parsedRoom.roomId;
 
   const token = url.searchParams.get("token");
   if (!token) {
     return errorResponse(request, env, 401, {
       code: "invalid_token",
-      message: "缺少 token"
+      message: "Missing token"
     });
   }
 
@@ -285,14 +470,14 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
   if (!session) {
     return errorResponse(request, env, 401, {
       code: "invalid_token",
-      message: "无效或过期的 token"
+      message: "Invalid or expired token"
     });
   }
 
   if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
     return errorResponse(request, env, 400, {
       code: "bad_request",
-      message: "必须使用 WebSocket 协议升级"
+      message: "WebSocket upgrade is required"
     });
   }
 
@@ -301,6 +486,8 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
   const forwardRequest = new Request(request.url, request);
   forwardRequest.headers.set("x-user-id", session.userId);
   forwardRequest.headers.set("x-nickname", session.nickname);
+  forwardRequest.headers.set("x-room-id", roomId);
+  forwardRequest.headers.set("x-media-base-url", mediaBaseUrl(request));
   return roomStub.fetch(forwardRequest);
 }
 
@@ -330,6 +517,14 @@ export default {
 
     if (url.pathname === API_PATHS.messages && request.method === "GET") {
       return fetchHistory(request, env);
+    }
+
+    if (url.pathname === API_PATHS.uploadImage && request.method === "POST") {
+      return handleUploadImage(request, env);
+    }
+
+    if (url.pathname.startsWith(`${API_PATHS.media}/`) && request.method === "GET") {
+      return handleMediaRequest(request, env);
     }
 
     if (url.pathname === API_PATHS.websocket && request.method === "GET") {

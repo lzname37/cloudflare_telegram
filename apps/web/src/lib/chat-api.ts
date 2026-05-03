@@ -1,13 +1,13 @@
 import {
   API_PATHS,
-  GLOBAL_ROOM_ID,
   type ApiErrorResponse,
   type CreateSessionResponse,
   type MessageHistoryResponse,
-  type ReconnectSyncResponse
+  type ReconnectSyncResponse,
+  type UploadImageResponse
 } from "../../../../packages/shared/protocol";
 
-type ApiSuccess = CreateSessionResponse | MessageHistoryResponse | ReconnectSyncResponse;
+type ApiSuccess = CreateSessionResponse | MessageHistoryResponse | ReconnectSyncResponse | UploadImageResponse;
 type ApiFailure = ApiErrorResponse;
 type ApiPayload = ApiSuccess | ApiFailure;
 
@@ -47,9 +47,13 @@ export class ChatApi {
     return payload.data;
   }
 
-  async getMessages(token: string, options?: { cursor?: string; limit?: number }): Promise<MessageHistoryResponse["data"]> {
+  async getMessages(
+    token: string,
+    roomId: string,
+    options?: { cursor?: string; limit?: number }
+  ): Promise<MessageHistoryResponse["data"]> {
     const query = new URLSearchParams();
-    query.set("room", GLOBAL_ROOM_ID);
+    query.set("room", roomId);
     if (options?.cursor) {
       query.set("cursor", options.cursor);
     }
@@ -68,9 +72,9 @@ export class ChatApi {
     return payload.data;
   }
 
-  async getMessagesAfter(token: string, afterTimestamp: number): Promise<ReconnectSyncResponse["data"]> {
+  async getMessagesAfter(token: string, roomId: string, afterTimestamp: number): Promise<ReconnectSyncResponse["data"]> {
     const query = new URLSearchParams();
-    query.set("room", GLOBAL_ROOM_ID);
+    query.set("room", roomId);
     query.set("after", String(afterTimestamp));
     const response = await fetch(`${this.baseUrl}${API_PATHS.messages}?${query.toString()}`, {
       method: "GET",
@@ -80,6 +84,25 @@ export class ChatApi {
     });
 
     const payload = await parseResponse<ReconnectSyncResponse>(response);
+    return payload.data;
+  }
+
+  async uploadImage(token: string, roomId: string, file: File): Promise<UploadImageResponse["data"]> {
+    const query = new URLSearchParams();
+    query.set("room", roomId);
+
+    const formData = new FormData();
+    formData.set("file", file);
+
+    const response = await fetch(`${this.baseUrl}${API_PATHS.uploadImage}?${query.toString()}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`
+      },
+      body: formData
+    });
+
+    const payload = await parseResponse<UploadImageResponse>(response);
     return payload.data;
   }
 }
