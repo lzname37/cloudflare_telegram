@@ -1,13 +1,15 @@
 import {
   API_PATHS,
   type ApiErrorResponse,
-  type CreateSessionResponse,
+  type AuthSessionResponse,
+  type LoginWithEmailRequest,
   type MessageHistoryResponse,
   type ReconnectSyncResponse,
+  type RegisterWithEmailRequest,
   type UploadImageResponse
 } from "../../../../packages/shared/protocol";
 
-type ApiSuccess = CreateSessionResponse | MessageHistoryResponse | ReconnectSyncResponse | UploadImageResponse;
+type ApiSuccess = AuthSessionResponse | MessageHistoryResponse | ReconnectSyncResponse | UploadImageResponse;
 type ApiFailure = ApiErrorResponse;
 type ApiPayload = ApiSuccess | ApiFailure;
 
@@ -34,17 +36,34 @@ async function parseResponse<T extends ApiPayload>(response: Response): Promise<
 export class ChatApi {
   constructor(private readonly baseUrl: string) {}
 
-  async createSession(nickname: string): Promise<CreateSessionResponse["data"]> {
-    const response = await fetch(`${this.baseUrl}${API_PATHS.session}`, {
+  getGithubOauthStartUrl(): string {
+    return `${this.baseUrl}${API_PATHS.authGithubStart}`;
+  }
+
+  async registerWithEmail(payload: RegisterWithEmailRequest): Promise<AuthSessionResponse["data"]> {
+    const response = await fetch(`${this.baseUrl}${API_PATHS.authEmailRegister}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({ nickname })
+      body: JSON.stringify(payload)
     });
 
-    const payload = await parseResponse<CreateSessionResponse>(response);
-    return payload.data;
+    const parsed = await parseResponse<AuthSessionResponse>(response);
+    return parsed.data;
+  }
+
+  async loginWithEmail(payload: LoginWithEmailRequest): Promise<AuthSessionResponse["data"]> {
+    const response = await fetch(`${this.baseUrl}${API_PATHS.authEmailLogin}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const parsed = await parseResponse<AuthSessionResponse>(response);
+    return parsed.data;
   }
 
   async getMessages(

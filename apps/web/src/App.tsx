@@ -1,30 +1,30 @@
-import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   ALLOWED_IMAGE_ACCEPT,
   API_PATHS,
   GLOBAL_ROOM_ID,
   MAX_IMAGE_SIZE_BYTES,
   MAX_MESSAGE_LENGTH,
-  MAX_NICKNAME_LENGTH,
+  MIN_PASSWORD_LENGTH,
   ROOM_ID_MAX_LENGTH,
   isImageMimeType,
   normalizeAndValidateRoomId,
   type AnyChatMessage,
+  type AuthSessionData,
   type ClientSocketEvent,
   type ServerSocketEvent
 } from "../../../packages/shared/protocol";
 import { ChatApi } from "./lib/chat-api";
 
-type SessionState = {
-  userId: string;
-  nickname: string;
-  token: string;
-};
-
+type SessionState = AuthSessionData;
+type AuthMode = "login" | "register";
 type ConnectionState = "idle" | "connecting" | "connected" | "reconnecting" | "disconnected";
 
-const SESSION_STORAGE_KEY = "cf_chat_session_v1";
+const SESSION_STORAGE_KEY = "cf_chat_session_v2";
 const ROOM_STORAGE_KEY = "cf_chat_room_v1";
+const LEGACY_SESSION_STORAGE_KEY = "cf_chat_session_v1";
+const OAUTH_SESSION_QUERY_KEY = "auth_session";
+const OAUTH_ERROR_QUERY_KEY = "auth_error";
 
 function toWsUrl(apiBase: string, token: string, roomId: string): string {
   const url = new URL(apiBase);
@@ -65,6 +65,20 @@ function mergeAndSortMessages(prev: AnyChatMessage[], incoming: AnyChatMessage[]
   });
 }
 
+function isValidSessionState(raw: unknown): raw is SessionState {
+  if (!raw || typeof raw !== "object") {
+    return false;
+  }
+
+  const value = raw as Record<string, unknown>;
+  return (
+    typeof value.userId === "string" &&
+    typeof value.nickname === "string" &&
+    typeof value.email === "string" &&
+    typeof value.token === "string"
+  );
+}
+
 function getStoredSession(): SessionState | null {
   const raw = localStorage.getItem(SESSION_STORAGE_KEY);
   if (!raw) {
@@ -72,11 +86,8 @@ function getStoredSession(): SessionState | null {
   }
 
   try {
-    const parsed = JSON.parse(raw) as SessionState;
-    if (!parsed.userId || !parsed.nickname || !parsed.token) {
-      return null;
-    }
-    return parsed;
+    const parsed = JSON.parse(raw) as unknown;
+    return isValidSessionState(parsed) ? parsed : null;
   } catch {
     return null;
   }
@@ -156,6 +167,38 @@ function normalizeIncomingMessageList(raw: unknown): AnyChatMessage[] {
   return items;
 }
 
+function base64UrlToBytes(input: string): Uint8Array {
+  const base64 = input.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = base64 + "=".repeat((4 - (base64.length % 4 || 4)) % 4);
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function decodeOAuthSession(raw: string): SessionState | null {
+  try {
+    const bytes = base64UrlToBytes(raw);
+    const json = new TextDecoder().decode(bytes);
+    const parsed = JSON.parse(json) as unknown;
+    return isValidSessionState(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function mapOAuthError(errorCode: string): string {
+  if (errorCode === "oauth_state_invalid") {
+    return "GitHub 登录失败：状态校验未通过，请重试。";
+  }
+  if (errorCode === "oauth_failed") {
+    return "GitHub 登录失败，请稍后重试。";
+  }
+  return "登录失败，请稍后重试。";
+}
+
 export function App() {
   const apiBase = useMemo(
     () => (import.meta.env.VITE_CHAT_API_BASE ?? "http://127.0.0.1:8787").replace(/\/+$/g, ""),
@@ -164,7 +207,9 @@ export function App() {
   const chatApi = useMemo(() => new ChatApi(apiBase), [apiBase]);
 
   const [session, setSession] = useState<SessionState | null>(getStoredSession);
-  const [nicknameInput, setNicknameInput] = useState("");
+  const [authMode, setAuthMode] = useState<AuthMode>("login");
+  const [emailInput, setEmailInput] = useState("");
+  const [passwordInput, setPasswordInput] = useState("");
   const [currentRoomId, setCurrentRoomId] = useState<string>(getStoredRoomId);
   const [roomInput, setRoomInput] = useState<string>(getStoredRoomId);
   const [messages, setMessages] = useState<AnyChatMessage[]>([]);
@@ -177,6 +222,8 @@ export function App() {
   const [onlineCount, setOnlineCount] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
   const [sendError, setSendError] = useState<string | null>(null);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [isSubmittingAuth, setIsSubmittingAuth] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -185,6 +232,38 @@ export function App() {
   const lastMessageTimestampRef = useRef(0);
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    localStorage.removeItem(LEGACY_SESSION_STORAGE_KEY);
+
+    const url = new URL(window.location.href);
+    const oauthSessionRaw = url.searchParams.get(OAUTH_SESSION_QUERY_KEY);
+    const oauthErrorRaw = url.searchParams.get(OAUTH_ERROR_QUERY_KEY);
+
+    if (!oauthSessionRaw && !oauthErrorRaw) {
+      return;
+    }
+
+    if (oauthSessionRaw) {
+      const parsedSession = decodeOAuthSession(oauthSessionRaw);
+      if (parsedSession) {
+        localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(parsedSession));
+        setSession(parsedSession);
+        setAuthError(null);
+        setNotice("已通过 GitHub 登录。");
+      } else {
+        setAuthError("GitHub 登录响应无效，请重试。");
+      }
+    }
+
+    if (oauthErrorRaw) {
+      setAuthError(mapOAuthError(oauthErrorRaw));
+    }
+
+    url.searchParams.delete(OAUTH_SESSION_QUERY_KEY);
+    url.searchParams.delete(OAUTH_ERROR_QUERY_KEY);
+    window.history.replaceState({}, document.title, url.toString());
+  }, []);
 
   useEffect(() => {
     if (messages.length === 0) {
@@ -299,7 +378,7 @@ export function App() {
             await syncMissingMessages();
           } catch (error) {
             console.error(error);
-            setNotice("重连成功，但补拉历史消息失败");
+            setNotice("重连成功，但补拉历史消息失败。");
           }
         }
       };
@@ -382,30 +461,54 @@ export function App() {
     };
   }, [apiBase, chatApi, currentRoomId, session]);
 
-  async function handleSignIn(event: FormEvent<HTMLFormElement>): Promise<void> {
+  async function handleEmailAuthSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
-    const nickname = nicknameInput.trim();
-    if (!nickname || nickname.length > MAX_NICKNAME_LENGTH) {
-      setNotice(`昵称不能为空且长度不能超过 ${MAX_NICKNAME_LENGTH}`);
+    if (isSubmittingAuth) {
       return;
     }
 
+    const email = emailInput.trim().toLowerCase();
+    const password = passwordInput;
+
+    if (!email) {
+      setAuthError("请输入邮箱地址。");
+      return;
+    }
+
+    if (!password) {
+      setAuthError("请输入密码。");
+      return;
+    }
+
+    if (authMode === "register" && password.length < MIN_PASSWORD_LENGTH) {
+      setAuthError(`密码长度至少为 ${MIN_PASSWORD_LENGTH} 位。`);
+      return;
+    }
+
+    setIsSubmittingAuth(true);
+    setAuthError(null);
+    setNotice(null);
+
     try {
-      const created = await chatApi.createSession(nickname);
-      const nextSession: SessionState = {
-        userId: created.userId,
-        nickname: created.nickname,
-        token: created.token
-      };
+      const nextSession =
+        authMode === "register"
+          ? await chatApi.registerWithEmail({ email, password })
+          : await chatApi.loginWithEmail({ email, password });
       localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(nextSession));
       setSession(nextSession);
-      setNicknameInput("");
-      setNotice(null);
+      setPasswordInput("");
+      setNotice(authMode === "register" ? "注册并登录成功。" : "登录成功。");
     } catch (error) {
       console.error(error);
-      const message = error instanceof Error ? error.message : "创建会话失败";
-      setNotice(message);
+      const message = error instanceof Error ? error.message : "登录失败";
+      setAuthError(message);
+    } finally {
+      setIsSubmittingAuth(false);
     }
+  }
+
+  function handleGithubAuth(): void {
+    window.location.assign(chatApi.getGithubOauthStartUrl());
   }
 
   function handleSignOut(): void {
@@ -414,25 +517,25 @@ export function App() {
     setCurrentRoomId(GLOBAL_ROOM_ID);
     setRoomInput(GLOBAL_ROOM_ID);
     localStorage.setItem(ROOM_STORAGE_KEY, GLOBAL_ROOM_ID);
-    setNotice("已退出当前会话");
+    setNotice("已退出当前会话。");
   }
 
   function handleJoinRoom(event: FormEvent<HTMLFormElement>): void {
     event.preventDefault();
     const normalized = normalizeAndValidateRoomId(roomInput);
     if (!normalized) {
-      setNotice("房间 ID 仅支持 a-z、0-9、_、- 且长度 1-32");
+      setNotice("房间 ID 仅支持 a-z、0-9、_、-，且长度 1-32。");
       return;
     }
 
     if (normalized === currentRoomId) {
-      setNotice(`当前已在房间 #${normalized}`);
+      setNotice(`当前已在房间 #${normalized}。`);
       return;
     }
 
     setCurrentRoomId(normalized);
     setRoomInput(normalized);
-    setNotice(`已切换到房间 #${normalized}`);
+    setNotice(`已切换到房间 #${normalized}。`);
     setSendError(null);
     localStorage.setItem(ROOM_STORAGE_KEY, normalized);
   }
@@ -459,15 +562,15 @@ export function App() {
     }
   }
 
-  function handleSendMessage(event: FormEvent<HTMLFormElement>): void {
-    event.preventDefault();
+  function sendCurrentDraft(): void {
     const content = draft.trim();
     if (!content) {
-      setSendError("消息不能为空");
+      setSendError("消息不能为空。");
       return;
     }
+
     if (content.length > MAX_MESSAGE_LENGTH) {
-      setSendError(`消息长度不能超过 ${MAX_MESSAGE_LENGTH}`);
+      setSendError(`消息长度不能超过 ${MAX_MESSAGE_LENGTH}。`);
       return;
     }
 
@@ -486,6 +589,22 @@ export function App() {
     setSendError(null);
   }
 
+  function handleSendMessage(event: FormEvent<HTMLFormElement>): void {
+    event.preventDefault();
+    sendCurrentDraft();
+  }
+
+  function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>): void {
+    if (event.key !== "Enter") {
+      return;
+    }
+
+    if (event.ctrlKey || event.metaKey) {
+      event.preventDefault();
+      sendCurrentDraft();
+    }
+  }
+
   async function handleSelectImage(event: ChangeEvent<HTMLInputElement>): Promise<void> {
     const file = event.currentTarget.files?.[0];
     event.currentTarget.value = "";
@@ -495,12 +614,12 @@ export function App() {
     }
 
     if (!session) {
-      setSendError("请先登录");
+      setSendError("请先登录。");
       return;
     }
 
     if (file.size > MAX_IMAGE_SIZE_BYTES) {
-      setSendError(`图片大小不能超过 ${Math.floor(MAX_IMAGE_SIZE_BYTES / (1024 * 1024))}MB`);
+      setSendError(`图片大小不能超过 ${Math.floor(MAX_IMAGE_SIZE_BYTES / (1024 * 1024))}MB。`);
       return;
     }
 
@@ -517,7 +636,7 @@ export function App() {
       const uploaded = await chatApi.uploadImage(session.token, currentRoomId, file);
       const liveSocket = wsRef.current;
       if (!liveSocket || liveSocket.readyState !== WebSocket.OPEN) {
-        throw new Error("连接已断开，图片上传成功但未发送，请重试");
+        throw new Error("连接已断开，图片上传成功但未发送，请重试。");
       }
 
       const payload: ClientSocketEvent = {
@@ -575,24 +694,69 @@ export function App() {
       <main className="chat-panel">
         {!session ? (
           <section className="signin-card">
-            <h1>进入聊天室</h1>
-            <p>输入昵称后开始聊天（匿名模式）。</p>
-            <form onSubmit={(event) => void handleSignIn(event)}>
+            <h1>登录后进入聊天室</h1>
+            <p>支持邮箱密码或 GitHub OAuth 登录。</p>
+
+            <div className="auth-mode-switch">
+              <button
+                type="button"
+                className={authMode === "login" ? "auth-mode-btn active" : "auth-mode-btn"}
+                onClick={() => {
+                  setAuthMode("login");
+                  setAuthError(null);
+                }}
+              >
+                邮箱登录
+              </button>
+              <button
+                type="button"
+                className={authMode === "register" ? "auth-mode-btn active" : "auth-mode-btn"}
+                onClick={() => {
+                  setAuthMode("register");
+                  setAuthError(null);
+                }}
+              >
+                邮箱注册
+              </button>
+            </div>
+
+            <form onSubmit={(event) => void handleEmailAuthSubmit(event)}>
               <input
-                value={nicknameInput}
-                onChange={(event) => setNicknameInput(event.target.value)}
-                placeholder="请输入昵称"
-                maxLength={MAX_NICKNAME_LENGTH}
+                value={emailInput}
+                type="email"
+                autoComplete="email"
+                onChange={(event) => setEmailInput(event.target.value)}
+                placeholder="请输入邮箱"
               />
-              <button type="submit">创建会话</button>
+              <input
+                value={passwordInput}
+                type="password"
+                autoComplete={authMode === "register" ? "new-password" : "current-password"}
+                onChange={(event) => setPasswordInput(event.target.value)}
+                placeholder={
+                  authMode === "register" ? `请输入密码（至少 ${MIN_PASSWORD_LENGTH} 位）` : "请输入密码"
+                }
+              />
+              <button type="submit" disabled={isSubmittingAuth}>
+                {isSubmittingAuth ? "提交中..." : authMode === "register" ? "注册并登录" : "登录"}
+              </button>
             </form>
+
+            <div className="oauth-divider">或</div>
+            <button type="button" className="github-btn" onClick={handleGithubAuth}>
+              使用 GitHub 登录
+            </button>
+
+            {authError ? <p className="auth-error">{authError}</p> : null}
           </section>
         ) : (
           <section className="chat-wrapper">
             <header className="chat-header">
               <div>
                 <strong>#{currentRoomId}</strong>
-                <p>{session.nickname}</p>
+                <p>
+                  {session.nickname} ({session.email})
+                </p>
               </div>
               <button className="ghost-btn" onClick={handleSignOut} type="button">
                 退出
@@ -639,7 +803,8 @@ export function App() {
               <textarea
                 value={draft}
                 onChange={(event) => setDraft(event.target.value)}
-                placeholder={`输入消息（最多 ${MAX_MESSAGE_LENGTH} 字）`}
+                onKeyDown={handleComposerKeyDown}
+                placeholder={`输入消息（最多 ${MAX_MESSAGE_LENGTH} 字，Ctrl/Cmd+Enter 发送）`}
                 maxLength={MAX_MESSAGE_LENGTH}
               />
               <div className="composer-actions">

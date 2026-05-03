@@ -8,7 +8,7 @@ import {
 } from "../../../packages/shared/protocol";
 
 type OriginEnv = {
-  ALLOWED_ORIGINS?: string;
+  ALLOWED_ORIGINS?: string | string[] | readonly string[];
 };
 
 export type ErrorResponseInput = {
@@ -29,10 +29,10 @@ function normalizeOriginValue(raw: string): string | null {
   }
 }
 
-function parseAllowedOrigins(raw?: string): Set<string> {
+function parseAllowedOrigins(raw?: string | string[] | readonly string[]): Set<string> {
+  const values = Array.isArray(raw) ? raw : String(raw ?? "").split(",");
   return new Set(
-    (raw ?? "")
-      .split(",")
+    values
       .map((item) => normalizeOriginValue(item))
       .filter((item): item is string => Boolean(item))
   );

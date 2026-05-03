@@ -1,6 +1,7 @@
 export const GLOBAL_ROOM_ID = "global";
 export const MAX_NICKNAME_LENGTH = 24;
 export const MAX_MESSAGE_LENGTH = 500;
+export const MIN_PASSWORD_LENGTH = 8;
 export const DEFAULT_HISTORY_LIMIT = 50;
 export const MAX_HISTORY_LIMIT = 100;
 export const ROOM_ID_MIN_LENGTH = 1;
@@ -17,6 +18,12 @@ export type ApiErrorCode =
   | "invalid_room"
   | "invalid_token"
   | "invalid_nickname"
+  | "invalid_email"
+  | "invalid_password"
+  | "email_taken"
+  | "account_not_found"
+  | "oauth_state_invalid"
+  | "oauth_failed"
   | "message_empty"
   | "message_too_long"
   | "invalid_image"
@@ -49,8 +56,31 @@ export interface CreateSessionResponse {
   data: {
     userId: string;
     nickname: string;
+    email?: string;
     token: string;
   };
+}
+
+export interface RegisterWithEmailRequest {
+  email: string;
+  password: string;
+}
+
+export interface LoginWithEmailRequest {
+  email: string;
+  password: string;
+}
+
+export interface AuthSessionData {
+  userId: string;
+  nickname: string;
+  email: string;
+  token: string;
+}
+
+export interface AuthSessionResponse {
+  ok: true;
+  data: AuthSessionData;
 }
 
 export interface ChatMessage {
@@ -256,6 +286,10 @@ export function toTextChatMessage(
 
 export const API_PATHS = {
   session: "/api/session",
+  authEmailRegister: "/api/auth/email/register",
+  authEmailLogin: "/api/auth/email/login",
+  authGithubStart: "/api/auth/github/start",
+  authGithubCallback: "/api/auth/github/callback",
   messages: "/api/messages",
   websocket: "/ws",
   uploadImage: "/api/uploads/image",

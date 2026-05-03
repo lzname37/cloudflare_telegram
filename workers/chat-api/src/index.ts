@@ -4,20 +4,34 @@ import {
   GLOBAL_ROOM_ID,
   MAX_HISTORY_LIMIT,
   MAX_IMAGE_SIZE_BYTES,
-  MAX_NICKNAME_LENGTH,
+  MIN_PASSWORD_LENGTH,
   createImageObjectKey,
   isImageMimeType,
   isSafeImageKey,
   type AnyChatMessage,
-  type CreateSessionRequest,
-  type CreateSessionResponse,
+  type AuthSessionData,
+  type AuthSessionResponse,
   type ImageMimeType,
+  type LoginWithEmailRequest,
   type MessageHistoryResponse,
   type ReconnectSyncResponse,
+  type RegisterWithEmailRequest,
   type SessionPayload,
   type UploadImageResponse
 } from "../../../packages/shared/protocol";
+import {
+  GITHUB_STATE_COOKIE_NAME,
+  buildClearedGithubStateCookie,
+  buildGithubAuthorizeUrl,
+  buildGithubStateCookie,
+  createGithubState,
+  deriveNicknameFromEmail,
+  normalizeEmail,
+  readCookie,
+  resolveGithubProfile
+} from "./auth";
 import { createSessionToken, verifySessionToken } from "./crypto";
+import { hashPassword, verifyPassword } from "./password";
 import { SlidingWindowRateLimiter } from "./rate-limit";
 import { ChatRoom } from "./room";
 import {
@@ -29,7 +43,6 @@ import {
   getBearerToken,
   getClientIp,
   jsonResponse,
-  normalizeNickname,
   resolveAllowedOrigin,
   resolveRoomId
 } from "./utils";
@@ -49,21 +62,48 @@ type MessageRecord = {
   created_at: number;
 };
 
+type UserRecord = {
+  user_id: string;
+  nickname: string;
+  email: string | null;
+  password_hash: string | null;
+  github_id: string | null;
+  first_seen_at: number;
+  last_seen_at: number;
+};
+
 export interface Env {
   CHAT_ROOM: DurableObjectNamespace<ChatRoom>;
   CHAT_DB: D1Database;
   CHAT_MEDIA: R2Bucket;
   SESSION_SECRET: string;
-  ALLOWED_ORIGINS?: string;
+  ALLOWED_ORIGINS?: string | string[] | readonly string[];
   SESSION_TTL_SECONDS?: string;
+  GITHUB_CLIENT_ID?: string;
+  GITHUB_CLIENT_SECRET?: string;
+  WEB_APP_ORIGIN?: string;
 }
 
-const SESSION_RATE_LIMIT_PER_MINUTE = 20;
-const sessionRateLimiter = new SlidingWindowRateLimiter();
+const AUTH_RATE_LIMIT_PER_MINUTE = 20;
+const authRateLimiter = new SlidingWindowRateLimiter();
 
 function getSessionTtlSeconds(env: Env): number {
   const ttl = Number(env.SESSION_TTL_SECONDS ?? 604800);
   return Number.isFinite(ttl) && ttl > 0 ? ttl : 604800;
+}
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function encodeAuthSession(data: AuthSessionData): string {
+  const serialized = JSON.stringify(data);
+  return bytesToBase64Url(new TextEncoder().encode(serialized));
 }
 
 function assertAllowedOrigin(request: Request, env: Env): Response | null {
@@ -150,73 +190,409 @@ function extractMediaKey(pathname: string): string | null {
   }
 }
 
-async function handleCreateSession(request: Request, env: Env): Promise<Response> {
+function buildAuthSession(userId: string, nickname: string, email: string, token: string): AuthSessionResponse {
+  return {
+    ok: true,
+    data: {
+      userId,
+      nickname,
+      email,
+      token
+    }
+  };
+}
+
+async function createSignedSession(userId: string, nickname: string, email: string, env: Env): Promise<AuthSessionData> {
+  const payload: SessionPayload = {
+    userId,
+    nickname,
+    issuedAt: Date.now()
+  };
+
+  const token = await createSessionToken(payload, env.SESSION_SECRET);
+  return {
+    userId,
+    nickname,
+    email,
+    token
+  };
+}
+
+async function findUserByEmail(env: Env, email: string): Promise<UserRecord | null> {
+  const row = await env.CHAT_DB.prepare(
+    `
+      SELECT user_id, nickname, email, password_hash, github_id, first_seen_at, last_seen_at
+      FROM users
+      WHERE email = ?
+      LIMIT 1
+    `
+  )
+    .bind(email)
+    .first<UserRecord>();
+
+  return row ?? null;
+}
+
+async function findUserByGithubId(env: Env, githubId: string): Promise<UserRecord | null> {
+  const row = await env.CHAT_DB.prepare(
+    `
+      SELECT user_id, nickname, email, password_hash, github_id, first_seen_at, last_seen_at
+      FROM users
+      WHERE github_id = ?
+      LIMIT 1
+    `
+  )
+    .bind(githubId)
+    .first<UserRecord>();
+
+  return row ?? null;
+}
+
+function getWebAppUrlOrError(request: Request, env: Env): { webAppUrl: URL } | { error: Response } {
+  const raw = env.WEB_APP_ORIGIN?.trim();
+  if (!raw) {
+    return {
+      error: errorResponse(request, env, 500, {
+        code: "internal_error",
+        message: "WEB_APP_ORIGIN is not configured"
+      })
+    };
+  }
+
+  try {
+    return { webAppUrl: new URL(raw) };
+  } catch {
+    return {
+      error: errorResponse(request, env, 500, {
+        code: "internal_error",
+        message: "WEB_APP_ORIGIN is invalid"
+      })
+    };
+  }
+}
+
+function buildRedirectToWebApp(env: Env, pathParams: (url: URL) => void): URL | null {
+  const raw = env.WEB_APP_ORIGIN?.trim();
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    const url = new URL(raw);
+    pathParams(url);
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+function redirectToWebAppError(request: Request, env: Env, errorCode: string, clearCookie: string): Response {
+  const redirectUrl = buildRedirectToWebApp(env, (url) => {
+    url.searchParams.set("auth_error", errorCode);
+  });
+
+  if (!redirectUrl) {
+    return errorResponse(request, env, 500, {
+      code: "oauth_failed",
+      message: "WEB_APP_ORIGIN is not configured"
+    });
+  }
+
+  const headers = buildCorsHeaders(request, env);
+  headers.set("Location", redirectUrl.toString());
+  headers.append("Set-Cookie", clearCookie);
+  return new Response(null, { status: 302, headers });
+}
+
+function redirectToWebAppWithSession(request: Request, env: Env, session: AuthSessionData, clearCookie: string): Response {
+  const redirectUrl = buildRedirectToWebApp(env, (url) => {
+    url.searchParams.set("auth_session", encodeAuthSession(session));
+  });
+
+  if (!redirectUrl) {
+    return errorResponse(request, env, 500, {
+      code: "oauth_failed",
+      message: "WEB_APP_ORIGIN is not configured"
+    });
+  }
+
+  const headers = buildCorsHeaders(request, env);
+  headers.set("Location", redirectUrl.toString());
+  headers.append("Set-Cookie", clearCookie);
+  return new Response(null, { status: 302, headers });
+}
+
+async function parseCredentialPayload<T extends RegisterWithEmailRequest | LoginWithEmailRequest>(
+  request: Request
+): Promise<T | null> {
+  try {
+    return (await request.json()) as T;
+  } catch {
+    return null;
+  }
+}
+
+function validateAuthRateLimit(request: Request, env: Env, keyPrefix: string): Response | null {
+  const ip = getClientIp(request);
+  if (!authRateLimiter.consume(`${keyPrefix}:${ip}`, AUTH_RATE_LIMIT_PER_MINUTE, 60_000)) {
+    return errorResponse(request, env, 429, {
+      code: "rate_limited",
+      message: "Too many authentication requests"
+    });
+  }
+
+  return null;
+}
+
+async function handleLegacyCreateSession(request: Request, env: Env): Promise<Response> {
   const originError = assertAllowedOrigin(request, env);
   if (originError) {
     return originError;
   }
 
-  let payload: CreateSessionRequest;
-  try {
-    payload = (await request.json()) as CreateSessionRequest;
-  } catch {
+  return errorResponse(request, env, 410, {
+    code: "bad_request",
+    message: "Anonymous session login is disabled. Use email or GitHub login."
+  });
+}
+
+async function handleRegisterWithEmail(request: Request, env: Env): Promise<Response> {
+  const originError = assertAllowedOrigin(request, env);
+  if (originError) {
+    return originError;
+  }
+
+  const limited = validateAuthRateLimit(request, env, "register");
+  if (limited) {
+    return limited;
+  }
+
+  const payload = await parseCredentialPayload<RegisterWithEmailRequest>(request);
+  if (!payload || typeof payload.email !== "string" || typeof payload.password !== "string") {
     return errorResponse(request, env, 400, {
       code: "bad_request",
       message: "Invalid JSON body"
     });
   }
 
-  if (!payload || typeof payload.nickname !== "string") {
+  const email = normalizeEmail(payload.email);
+  if (!email) {
     return errorResponse(request, env, 400, {
-      code: "invalid_nickname",
-      message: "Invalid nickname"
+      code: "invalid_email",
+      message: "Invalid email address"
     });
   }
 
-  const nickname = normalizeNickname(payload.nickname);
-  if (!nickname || nickname.length > MAX_NICKNAME_LENGTH) {
+  if (payload.password.length < MIN_PASSWORD_LENGTH) {
     return errorResponse(request, env, 400, {
-      code: "invalid_nickname",
-      message: `Nickname must be 1-${MAX_NICKNAME_LENGTH} chars`
+      code: "invalid_password",
+      message: `Password must be at least ${MIN_PASSWORD_LENGTH} characters`
     });
   }
 
-  const ip = getClientIp(request);
-  if (!sessionRateLimiter.consume(`session:${ip}`, SESSION_RATE_LIMIT_PER_MINUTE, 60_000)) {
-    return errorResponse(request, env, 429, {
-      code: "rate_limited",
-      message: "Too many session requests"
-    });
-  }
-
-  const userId = crypto.randomUUID();
+  const passwordHash = await hashPassword(payload.password);
   const now = Date.now();
-  const sessionPayload: SessionPayload = {
-    userId,
-    nickname,
-    issuedAt: now
-  };
+  const userId = crypto.randomUUID();
+  const nickname = deriveNicknameFromEmail(email);
 
-  const token = await createSessionToken(sessionPayload, env.SESSION_SECRET);
+  try {
+    await env.CHAT_DB.prepare(
+      `
+        INSERT INTO users (user_id, nickname, email, password_hash, first_seen_at, last_seen_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `
+    )
+      .bind(userId, nickname, email, passwordHash, now, now)
+      .run();
+  } catch (error) {
+    const message = String(error);
+    if (message.includes("UNIQUE constraint failed")) {
+      return errorResponse(request, env, 409, {
+        code: "email_taken",
+        message: "Email is already registered"
+      });
+    }
+
+    console.error("Email registration failed", error);
+    return errorResponse(request, env, 500, {
+      code: "internal_error",
+      message: "Failed to create account"
+    });
+  }
+
+  const session = await createSignedSession(userId, nickname, email, env);
+  return jsonResponse(request, env, buildAuthSession(session.userId, session.nickname, session.email, session.token), 201);
+}
+
+async function handleLoginWithEmail(request: Request, env: Env): Promise<Response> {
+  const originError = assertAllowedOrigin(request, env);
+  if (originError) {
+    return originError;
+  }
+
+  const limited = validateAuthRateLimit(request, env, "login");
+  if (limited) {
+    return limited;
+  }
+
+  const payload = await parseCredentialPayload<LoginWithEmailRequest>(request);
+  if (!payload || typeof payload.email !== "string" || typeof payload.password !== "string") {
+    return errorResponse(request, env, 400, {
+      code: "bad_request",
+      message: "Invalid JSON body"
+    });
+  }
+
+  const email = normalizeEmail(payload.email);
+  if (!email) {
+    return errorResponse(request, env, 400, {
+      code: "invalid_email",
+      message: "Invalid email address"
+    });
+  }
+
+  const user = await findUserByEmail(env, email);
+  if (!user) {
+    return errorResponse(request, env, 404, {
+      code: "account_not_found",
+      message: "Account not found"
+    });
+  }
+
+  if (!user.password_hash) {
+    return errorResponse(request, env, 401, {
+      code: "invalid_password",
+      message: "Password login is not available for this account"
+    });
+  }
+
+  const matched = await verifyPassword(payload.password, user.password_hash);
+  if (!matched) {
+    return errorResponse(request, env, 401, {
+      code: "invalid_password",
+      message: "Invalid password"
+    });
+  }
+
+  const now = Date.now();
   await env.CHAT_DB.prepare(
     `
-      INSERT OR REPLACE INTO users (user_id, nickname, first_seen_at, last_seen_at)
-      VALUES (?, ?, ?, ?)
+      UPDATE users
+      SET last_seen_at = ?
+      WHERE user_id = ?
     `
   )
-    .bind(userId, nickname, now, now)
+    .bind(now, user.user_id)
     .run();
 
-  const responseBody: CreateSessionResponse = {
-    ok: true,
-    data: {
-      userId,
-      nickname,
-      token
-    }
-  };
+  const session = await createSignedSession(user.user_id, user.nickname, email, env);
+  return jsonResponse(request, env, buildAuthSession(session.userId, session.nickname, session.email, session.token), 200);
+}
 
-  return jsonResponse(request, env, responseBody, 201);
+async function handleGithubOauthStart(request: Request, env: Env): Promise<Response> {
+  const originError = assertAllowedOrigin(request, env);
+  if (originError) {
+    return originError;
+  }
+
+  const webAppConfig = getWebAppUrlOrError(request, env);
+  if ("error" in webAppConfig) {
+    return webAppConfig.error;
+  }
+  void webAppConfig.webAppUrl;
+
+  const clientId = env.GITHUB_CLIENT_ID?.trim();
+  if (!clientId) {
+    return errorResponse(request, env, 500, {
+      code: "oauth_failed",
+      message: "GitHub OAuth is not configured"
+    });
+  }
+
+  const state = createGithubState();
+  const authorizeUrl = buildGithubAuthorizeUrl(request, clientId, state);
+
+  const headers = buildCorsHeaders(request, env);
+  headers.set("Location", authorizeUrl);
+  headers.append("Set-Cookie", buildGithubStateCookie(request, state));
+  return new Response(null, { status: 302, headers });
+}
+
+async function handleGithubOauthCallback(request: Request, env: Env): Promise<Response> {
+  const clearStateCookie = buildClearedGithubStateCookie(request);
+  const url = new URL(request.url);
+  const code = url.searchParams.get("code");
+  const state = url.searchParams.get("state");
+  const expectedState = readCookie(request, GITHUB_STATE_COOKIE_NAME);
+
+  if (!code || !state || !expectedState || state !== expectedState) {
+    return redirectToWebAppError(request, env, "oauth_state_invalid", clearStateCookie);
+  }
+
+  try {
+    const githubProfile = await resolveGithubProfile(request, env, code);
+    const now = Date.now();
+
+    let user = await findUserByEmail(env, githubProfile.email);
+    if (user) {
+      if (user.github_id && user.github_id !== githubProfile.githubId) {
+        return redirectToWebAppError(request, env, "oauth_failed", clearStateCookie);
+      }
+
+      await env.CHAT_DB.prepare(
+        `
+          UPDATE users
+          SET github_id = ?, last_seen_at = ?
+          WHERE user_id = ?
+        `
+      )
+        .bind(githubProfile.githubId, now, user.user_id)
+        .run();
+    } else {
+      user = await findUserByGithubId(env, githubProfile.githubId);
+      if (user) {
+        await env.CHAT_DB.prepare(
+          `
+            UPDATE users
+            SET email = ?, last_seen_at = ?
+            WHERE user_id = ?
+          `
+        )
+          .bind(githubProfile.email, now, user.user_id)
+          .run();
+      } else {
+        const userId = crypto.randomUUID();
+        await env.CHAT_DB.prepare(
+          `
+            INSERT INTO users (user_id, nickname, email, github_id, first_seen_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+          `
+        )
+          .bind(userId, githubProfile.nickname, githubProfile.email, githubProfile.githubId, now, now)
+          .run();
+
+        user = {
+          user_id: userId,
+          nickname: githubProfile.nickname,
+          email: githubProfile.email,
+          password_hash: null,
+          github_id: githubProfile.githubId,
+          first_seen_at: now,
+          last_seen_at: now
+        };
+      }
+    }
+
+    if (!user.email) {
+      return redirectToWebAppError(request, env, "oauth_failed", clearStateCookie);
+    }
+
+    const session = await createSignedSession(user.user_id, user.nickname, user.email, env);
+    return redirectToWebAppWithSession(request, env, session, clearStateCookie);
+  } catch (error) {
+    console.error("GitHub OAuth callback failed", error);
+    return redirectToWebAppError(request, env, "oauth_failed", clearStateCookie);
+  }
 }
 
 async function authenticate(request: Request, env: Env): Promise<SessionPayload | null> {
@@ -512,7 +888,23 @@ export default {
     }
 
     if (url.pathname === API_PATHS.session && request.method === "POST") {
-      return handleCreateSession(request, env);
+      return handleLegacyCreateSession(request, env);
+    }
+
+    if (url.pathname === API_PATHS.authEmailRegister && request.method === "POST") {
+      return handleRegisterWithEmail(request, env);
+    }
+
+    if (url.pathname === API_PATHS.authEmailLogin && request.method === "POST") {
+      return handleLoginWithEmail(request, env);
+    }
+
+    if (url.pathname === API_PATHS.authGithubStart && request.method === "GET") {
+      return handleGithubOauthStart(request, env);
+    }
+
+    if (url.pathname === API_PATHS.authGithubCallback && request.method === "GET") {
+      return handleGithubOauthCallback(request, env);
     }
 
     if (url.pathname === API_PATHS.messages && request.method === "GET") {
